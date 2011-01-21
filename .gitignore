@@ -17,6 +17,7 @@
 /git-branch
 /git-bundle
 /git-cat-file
+/git-ccnx
 /git-check-attr
 /git-check-ref-format
 /git-checkout
