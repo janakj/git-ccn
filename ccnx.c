@@ -36,6 +36,8 @@
 #include "tag.h"
 
 
+#define STR_INIT(v) {(v), sizeof(v) - 1}
+
 /* Format of location information. Includes the pid of the process, filename,
  * function name, and line number. */
 #define LOC_FMT "[%d:%s:%s:%d]"
@@ -123,6 +125,18 @@ static struct ccn *parent_link;
 /* CCN forwarding link in a child process, this link forwards Interest packets
  * with the prefix for only one repository handled by the child process. */
 static struct ccn *child_link;
+
+/* A list of special files from the git repository that can be served
+ * directly. */
+static struct {
+    char *name;
+    size_t len;
+} specials[] = {
+    STR_INIT("HEAD"),
+    STR_INIT("description"),
+    STR_INIT("info/refs"),
+    STR_INIT("objects/info/packs"),
+    {NULL, 0}};
 
 
 /* Returns text representation of current date and time. Only current month,
@@ -320,6 +334,42 @@ out:
 }
 
 
+/* Load the contents of the file in name into a ccn_charbuf */
+static int
+load_file(struct ccn_charbuf **dst, const char *name)
+{
+    struct ccn_charbuf *res = NULL;
+    FILE *f;
+    unsigned char *p;
+    int r;
+
+    if (!(f = fopen(name, "r")))
+        return 1;
+    if (!(res = ccn_charbuf_create()))
+        goto error;
+
+    do {
+        if (!(p = ccn_charbuf_reserve(res, 256)))
+            goto error;
+        r = fread(p, 1, 256, f);
+        if (r == 0 && ferror(f)) {
+            ERR("Error while reading file '%s'", name);
+            goto error;
+        } else if (r > 0)
+            res->length += r;
+    } while(r);
+
+    fclose(f);
+    *dst = res;
+    return 0;
+
+error:
+    ccn_charbuf_destroy(&res);
+    fclose(f);
+    return -1;
+}
+
+
 /* This function is CCN Interest handler. It is called whenever ccnd receives
  * a matching Interest packet. The function is supposed to handle the Interest
  * and produce corresponding Data. */
@@ -332,7 +382,7 @@ child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
     enum ccn_upcall_res res = CCN_UPCALL_RESULT_OK;
     struct ccn_charbuf *body = NULL, *data = NULL, *dname = NULL;
     struct ccn_signing_params sp = CCN_SIGNING_PARAMS_INIT;
-    unsigned int b, e;
+    unsigned int b, e, i, v;
 
     sp.freshness = 10;
     switch(kind) {
@@ -373,6 +423,19 @@ child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
         /* Return the list of all refs from the repository */
         if (!(body = get_reflist()))
             goto error;
+    } else {
+        /* Serve special files from the git repository */
+        for(i = 0; specials[i].name; i++) {
+            if (op_len == specials[i].len
+                && !strncmp((char*)op, specials[i].name, op_len)) {
+                v = load_file(&body, specials[i].name);
+                if (v > 0)
+                    goto out; /* File not found */
+                else if (v < 0)
+                    goto error; /* Error reading file */
+                break;
+            }
+        }
     }
 
     /* If the functions above produced content, even empty, sign it */
