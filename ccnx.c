@@ -24,6 +24,13 @@
 #include <string.h>
 #include <time.h>
 #include <syslog.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <limits.h>
+#include <errno.h>
+#include "strbuf.h"
+#include "cache.h"
 
 
 /* Format of location information. Includes the pid of the process, filename,
@@ -106,6 +113,14 @@ Options:\n\
 static int log_syslog = 1;
 static int log_level = LOG_WARNING;
 
+/* CCN forwarding link in the parent process, this link forwards Interest
+ * packets with the prefix common for all git repositories. */
+static struct ccn *parent_link;
+
+/* CCN forwarding link in a child process, this link forwards Interest packets
+ * with the prefix for only one repository handled by the child process. */
+static struct ccn *child_link;
+
 
 /* Returns text representation of current date and time. Only current month,
  * day and time down to a second are printed. This is used when logging to the
@@ -162,19 +177,6 @@ inc_log_level(void)
 }
 
 
-/* This function is CCN Interest handler. It is called whenever ccnd receives
- * a matching Interest packet. The function is supposed to handle the Interest
- * and produce corresponding Data. */
-static enum ccn_upcall_res
-handle_interest(struct ccn_closure *selfp,
-                enum ccn_upcall_kind kind,
-                struct ccn_upcall_info *info)
-{
-    INF("Interest Request Received");
-    return CCN_UPCALL_RESULT_OK;
-}
-
-
 static void
 stop_ccn_forwarding(struct ccn **c)
 {
@@ -224,10 +226,144 @@ error:
 }
 
 
+/* This function is CCN Interest handler. It is called whenever ccnd receives
+ * a matching Interest packet. The function is supposed to handle the Interest
+ * and produce corresponding Data. */
+static enum ccn_upcall_res
+child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
+              struct ccn_upcall_info *info)
+{
+    return CCN_UPCALL_RESULT_OK;
+}
+
+
+/* This function is CCN Interest handler. It is called whenever ccnd receives
+ * a matching Interest packet. The function is supposed to handle the Interest
+ * and produce corresponding Data. */
+static enum ccn_upcall_res
+parent_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
+               struct ccn_upcall_info *info)
+{
+    int res = CCN_UPCALL_RESULT_OK;
+    pid_t child;
+    struct strbuf path = STRBUF_INIT;
+    const unsigned char *repo;
+    size_t len;
+
+    switch(kind) {
+    case CCN_UPCALL_FINAL:
+        free(selfp);
+    case CCN_UPCALL_CONSUMED_INTEREST:
+        goto out;
+    case CCN_UPCALL_INTEREST:
+        break;
+    default:
+        goto error;
+    }
+    /* Check if it is OK to produce new data */
+    if (!(info->pi->answerfrom & CCN_AOK_NEW))
+        goto out;
+
+    /* Make sure we received git repository name in Interest's prefix. */
+    if (info->matched_comps >= info->interest_comps->n) {
+        ERR("Prefix does not contain git repository name.");
+        goto error;
+    }
+
+    if (ccn_name_comp_get(info->interest_ccnb, info->interest_comps,
+                          info->matched_comps,
+                          &repo, &len) < 0) {
+        ERR("Error while extrating git repository name from prefix.");
+        goto error;
+    }
+
+    /* We're in the parent process and we received a request for a repository
+     * for which we have no child yet (otherwise the Interest would have been
+     * forwarded to the child). Before proceeding to the expensive fork, make
+     * sure that the git repository exists and appears to be usable. */
+    strbuf_init(&path, PATH_MAX);
+    strbuf_addstr(&path, repo_root);
+    strbuf_addch(&path, '/');
+    strbuf_add(&path, repo, len);
+
+    /* Try the directory as a bare git repository first. If it does not look
+     * like a bare repository, try the ".git" sub-directory instead. */
+    if (!is_git_directory(path.buf)) {
+        strbuf_addstr(&path, "/.git");
+        if (!is_git_directory(path.buf))
+            goto error;
+    }
+
+    /* We're in the parent process here. This is the process that registers
+     * Interests for the general prefix common for all git repositories. The
+     * goal of this process is only to create a new child process and pass the
+     * Interest packet to it. The child process will then generate the
+     * corresponding Data packet and send it to ccnd over its own forwarding
+     * link. This magic is necessesary for git code to function properly. Most
+     * git functions die by exiting the process when something goes wrong, so
+     * we have to execute them in a process of their own to make sure that the
+     * main daemon continues functioning. Also, once the process initializes a
+     * git repository, it's probably not possible (or at least easy) to
+     * reinitialize it. Hence one process can handle only one git repository.
+     */
+    child = fork();
+    if (child == -1) {
+        ERR("Can't create a child process: %s", strerror(errno));
+        goto error;
+    } else if (child == 0) {
+        /* Here comes a new child, pure and innocent. We need to setup a new
+         * link to ccnd here, to avoid sharing the link inherited from the
+         * parent. We do not disconnect the link to ccnd inherited from the
+         * parent, the parent process is still using it and will take care of
+         * it. */
+        ccn_name_append(prefix, repo, len);
+
+        if (!(child_link = setup_ccn_forwarding(prefix, child_handler))) {
+            ERR("Failed to setup ccn forwarding.");
+            exit(EXIT_FAILURE);
+        }
+
+        if (chdir(path.buf) < 0) {
+            ERR("Can't enter directory '%s': %s\n", path.buf, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        setup_git_directory();
+
+        while(1)
+            if (ccn_run(child_link, -1) < 0) {
+                ERR("Error in event loop in a child process");
+                goto error;
+            }
+
+        stop_ccn_forwarding(&child_link);
+        exit(EXIT_SUCCESS);
+    }
+
+    goto out;
+error:
+    res = CCN_UPCALL_RESULT_ERR;
+out:
+    strbuf_release(&path);
+    return res;
+}
+
+
+static void
+sig_child(int signo)
+{
+    int status, child_val;
+
+    if (waitpid(-1, &status, WNOHANG) < 0)
+        return;
+    if (WIFEXITED(status)) {
+        child_val = WEXITSTATUS(status);
+    }
+}
+
+
 int
 main(int argc, char *argv[])
 {
-    struct ccn *c;
     int res = EXIT_SUCCESS, opt;
 
     start_logger();
@@ -266,12 +402,17 @@ main(int argc, char *argv[])
         goto error;
     if (ccn_name_from_uri(prefix, prefix_str) < 0)
         goto error;
-    if (!(c = setup_ccn_forwarding(prefix, handle_interest)))
+    if (!(parent_link = setup_ccn_forwarding(prefix, parent_handler)))
         goto error;
 
+    if (signal(SIGCHLD, sig_child) == SIG_ERR) {
+        ERR("Can't setup SIGCHLD handler.");
+        goto error;
+    }
+
     while(1) {
-        if (ccn_run(c, -1) < 0) {
-            ERR("Error in ccn_run");
+        if (ccn_run(parent_link, -1) < 0) {
+            ERR("Error in ccn_run in dispatcher process");
             goto error;
         }
     }
@@ -280,7 +421,7 @@ main(int argc, char *argv[])
 error:
     res = EXIT_FAILURE;
 out:
-    stop_ccn_forwarding(&c);
+    stop_ccn_forwarding(&parent_link);
     ccn_charbuf_destroy(&prefix);
     stop_logger();
     exit(res);
