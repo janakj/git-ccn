@@ -15,6 +15,45 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
+/*
+ * TODO:
+ * - Fix the race condition where the parent starts a child and receives
+ *   another Interest request while the child hasn't registered its forwarding
+ *   path yet. In that case the parent would receive the Interest but would
+ *   either start another child (if children are not tracked) or ignore it. We
+ *   have to make sure that the Interest gets delivered to the newly created
+ *   child somehow.
+ *
+ * - Implement a list of active children along with some statistics about
+ *   their return values. This might be needed to prevent forking bombs caused
+ *   by broken or slow repositories.
+ *
+ * - Detect when the parent process receives an Interest for a repository for
+ *   which we already have a child created. That indicates a problem in the
+ *   child and the child might need to be restarted.
+ *
+ * - Implement inactivity timeout for children.
+ *
+ * - The loop in ccn_run does not work as expecited when ccn_set_run_timeout
+ *   is used. There is a conflict between timed operations, such as
+ *   registration refreshes, running from the function and timeouts requested
+ *   by ccn_set_run_timeout. The function ccn_run would usually timeout on a
+ *   next registration refresh and not after the timeout value specified with
+ *   ccn_set_run_timeout. Hence the function is really usuable only for
+ *   setting the timeout value to zero and thus its name ccn_set_run_timeout
+ *   may be misleading.
+ *
+ * - Right now the child process is only able to process the initial Interest
+ *   packet that created the process because after calling fork the kernel
+ *   switches to the new process immediately and ccnd forwards the request
+ *   also to the new child. This may or may not be true in future versions or
+ *   on different platforms, so wee need to make sure that we pass the initial
+ *   request to the child explicitly for processing.
+ *
+ * - Add support for sha1 ids in binary form in Interest prefixes. This takes
+ *   some escaping.
+ */
+
 #include <ccn/ccn.h>
 #include <ccn/uri.h>
 #include <ccn/reg_mgmt.h>
