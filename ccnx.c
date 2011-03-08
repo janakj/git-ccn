@@ -382,7 +382,8 @@ child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
     enum ccn_upcall_res res = CCN_UPCALL_RESULT_OK;
     struct ccn_charbuf *body = NULL, *data = NULL, *dname = NULL;
     struct ccn_signing_params sp = CCN_SIGNING_PARAMS_INIT;
-    unsigned int b, e, i, v;
+    unsigned int b, e, i, v, comps_left;
+    void *obj = NULL;
 
     sp.freshness = 10;
     switch(kind) {
@@ -398,7 +399,8 @@ child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
 
     /* -1 to ignore the final digest component that is present in every
         Interest prefix */
-    if ((info->interest_comps->n - info->matched_comps - 1) != 1)
+    comps_left = info->interest_comps->n - info->matched_comps - 1;
+    if (comps_left < 1)
         goto out;
     if (ccn_name_comp_get(info->interest_ccnb, info->interest_comps,
                           info->matched_comps, &op, &op_len) < 0) {
@@ -419,11 +421,38 @@ child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
     ccn_charbuf_append(dname, info->interest_ccnb + b, e - b);
     ccn_charbuf_append_closer(dname);
 
-    if (op_len == 4 && !strncmp((char*)op, "refs", op_len)) {
+    if (comps_left == 1 && op_len == 4
+        && !strncmp((char*)op, "refs", op_len)) {
         /* Return the list of all refs from the repository */
         if (!(body = get_reflist()))
             goto error;
-    } else {
+    } else if (comps_left == 2 && op_len == 7
+               && !strncmp((char*)op, "objects", op_len)) {
+        /* Lookup the object with the given SHA1 and return it */
+        unsigned char sha1[20];
+        const unsigned char* hex;
+        enum object_type type;
+        size_t len;
+
+        /* FIXME: We should switch to binary representation of SHA1, once I
+         * figure out how to encode it safely into components */
+        v = ccn_name_comp_get(info->interest_ccnb, info->interest_comps,
+                              info->matched_comps + 1, &hex, &len);
+        if (v < 0 || len != 40)
+            goto out;
+        if (get_sha1_hex((const char*)hex, sha1) != 0)
+            goto out;
+        if (!(obj = read_sha1_file_repl(sha1, &type, &len, NULL)))
+            goto out;
+        if (!(body = ccn_charbuf_create())) {
+            ERR("Memory allocation failure");
+            goto error;
+        }
+        if (ccn_charbuf_append(body, obj, len) < 0) {
+            ERR("Can't copy object");
+            goto error;
+        }
+    } else if (comps_left == 1){
         /* Serve special files from the git repository */
         for(i = 0; specials[i].name; i++) {
             if (op_len == specials[i].len
@@ -456,6 +485,8 @@ child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
 error:
     res = CCN_UPCALL_RESULT_ERR;
 out:
+    if (obj)
+        free(obj);
     ccn_charbuf_destroy(&body);
     ccn_charbuf_destroy(&data);
     ccn_charbuf_destroy(&dname);
