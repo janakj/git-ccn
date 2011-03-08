@@ -31,6 +31,9 @@
 #include <errno.h>
 #include "strbuf.h"
 #include "cache.h"
+#include "refs.h"
+#include "object.h"
+#include "tag.h"
 
 
 /* Format of location information. Includes the pid of the process, filename,
@@ -226,6 +229,97 @@ error:
 }
 
 
+/* Because we currently have no way of passing the target of a symref to the
+ * append_ref function, we store it temporarily in a global variable for the
+ * function to pick up. */
+static const char *symref;
+
+static int
+append_ref(const char *ref, const unsigned char *sha1, int flag, void *output)
+{
+    struct object *o;
+    struct ccn_charbuf *buf = (struct ccn_charbuf *)output;
+    int res = 0;
+
+    /* Make sure this is aligned with the ref_entry structure in
+     * remote-ccnx.c. The SHA1, ref_name and symref strings are appended right
+     * after this structure in the output buffer. */
+    struct ref_entry {
+        unsigned int flags;
+        unsigned int ref_len;
+        unsigned int symref_len;
+    } e;
+
+    if (!buf || (!(o = parse_object(sha1))))
+        return -1;
+
+    e.flags = htonl(flag);
+    e.ref_len = htonl(strlen(ref));
+    e.symref_len = htonl(symref ? strlen(symref) : 0);
+
+    /* Here we're inventing our own format for the list of all references.
+     * Each record starts with the flag field, followed by the length of the
+     * name of the ref, followed by the length of the target of the symref (if
+     * any). That way all fixed size elements are at the beginning of the data
+     * structure and we won't have problems with alignment. The 20-byte SHA1
+     * follows the structure, followed by the ref_len+1 bytes of ref_name and
+     * symref_len+1 bytes of symref. Both strings are zero-terminated but the
+     * terminators are not included in ref_len and symref_len. The symref is
+     * currently only used for the HEAD ref, because for other refs we don't
+     * get the target of the symref from the caller (to be fixed). */
+    res |= ccn_charbuf_append(buf, &e, sizeof(struct ref_entry));
+    res |= ccn_charbuf_append(buf, sha1, 20);
+    res |= ccn_charbuf_append(buf, ref, ntohl(e.ref_len) + 1);
+    res |= ccn_charbuf_append(buf, symref ? symref : "\0",
+                              ntohl(e.symref_len) + 1);
+
+    if (!res && o->type == OBJ_TAG && (o = deref_tag(o, ref, 0))) {
+        /* This is a tag object and we found its non-tag target. Add it as
+         * another ref with "^{}" appended to its name. This is used by
+         * clients to resolve and synchronize remote tags. */
+        struct strbuf tmp = STRBUF_INIT;
+        strbuf_init(&tmp, ntohl(e.ref_len) + 4);
+        strbuf_add(&tmp, ref, ntohl(e.ref_len));
+        strbuf_add(&tmp, "^{}", 4); /* 4 includes '\0' at the end */
+        res |= append_ref(tmp.buf, o->sha1, 0, output);
+        strbuf_release(&tmp);
+    }
+    return res;
+}
+
+
+static struct ccn_charbuf *
+get_reflist(void)
+{
+    unsigned char sha1[20];
+    struct ccn_charbuf *out = NULL;
+    int flag;
+
+    if (!(out = ccn_charbuf_create()))
+        goto error;
+
+    /* FIXME: This was taken from remote-curl.c, but we might need a better
+     * algorithm for obtaining the list of all refs so that we can preserve
+     * symrefs and their targets in the list and pass that all the way to the
+     * client. Currently we do that for HEAD in a hackish way. */
+    if (for_each_ref(append_ref, out))
+        goto error;
+
+    if ((symref = resolve_ref("HEAD", sha1, 1, &flag)))
+        if (append_ref("HEAD", sha1, flag, out))
+            goto error;
+
+    goto out;
+error:
+    ccn_charbuf_destroy(&out);
+out:
+    symref = NULL;
+    if (!out)
+        ERR("Failed to generate refs list.");
+    return out;
+}
+
+
 /* This function is CCN Interest handler. It is called whenever ccnd receives
  * a matching Interest packet. The function is supposed to handle the Interest
  * and produce corresponding Data. */
@@ -233,7 +327,76 @@ static enum ccn_upcall_res
 child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
               struct ccn_upcall_info *info)
 {
-    return CCN_UPCALL_RESULT_OK;
+    const unsigned char *op;
+    size_t op_len;
+    enum ccn_upcall_res res = CCN_UPCALL_RESULT_OK;
+    struct ccn_charbuf *body = NULL, *data = NULL, *dname = NULL;
+    struct ccn_signing_params sp = CCN_SIGNING_PARAMS_INIT;
+    unsigned int b, e;
+
+    sp.freshness = 10;
+    switch(kind) {
+    case CCN_UPCALL_FINAL:
+        free(selfp);
+    case CCN_UPCALL_CONSUMED_INTEREST:
+        goto out;
+    case CCN_UPCALL_INTEREST:
+        break;
+    default:
+        goto error;
+    }
+
+    /* -1 to ignore the final digest component that is present in every
+        Interest prefix */
+    if ((info->interest_comps->n - info->matched_comps - 1) != 1)
+        goto out;
+    if (ccn_name_comp_get(info->interest_ccnb, info->interest_comps,
+                          info->matched_comps, &op, &op_len) < 0) {
+        ERR("Error while extrating git operation from prefix.");
+        goto error;
+    }
+
+    /* Create Data packet buffers */
+    data = ccn_charbuf_create();
+    dname = ccn_charbuf_create();
+    if (!data || !dname) {
+        ERR("Memory allocation failure.\n");
+        goto error;
+    }
+
+    b = info->pi->offset[CCN_PI_B_Name];
+    e = info->pi->offset[CCN_PI_E_ComponentLast];
+    ccn_charbuf_append(dname, info->interest_ccnb + b, e - b);
+    ccn_charbuf_append_closer(dname);
+
+    if (op_len == 4 && !strncmp((char*)op, "refs", op_len)) {
+        /* Return the list of all refs from the repository */
+        if (!(body = get_reflist()))
+            goto error;
+    }
+
+    /* If the functions above produced content, even empty, sign it */
+    if (!body) goto out;
+    if (ccn_sign_content(info->h, data, dname, &sp,
+                         body->buf, body->length) < 0)
+        goto error;
+
+    if (data->length > 65535) {
+        INF("Object may be too big to send in one piece: %lu", data->length);
+    }
+
+    if (ccn_put(info->h, data->buf, data->length) < 0)
+        goto error;
+    res = CCN_UPCALL_RESULT_INTEREST_CONSUMED;
+
+    goto out;
+error:
+    res = CCN_UPCALL_RESULT_ERR;
+out:
+    ccn_charbuf_destroy(&body);
+    ccn_charbuf_destroy(&data);
+    ccn_charbuf_destroy(&dname);
+    return res;
 }
 
 
