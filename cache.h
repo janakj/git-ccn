@@ -427,6 +427,7 @@ extern void set_git_work_tree(const char *tree);
 
 extern const char **get_pathspec(const char *prefix, const char **pathspec);
 extern void setup_work_tree(void);
+extern int is_git_directory(const char *);
 extern const char *setup_git_directory_gently(int *);
 extern const char *setup_git_directory(void);
 extern char *prefix_path(const char *prefix, int len, const char *path);
