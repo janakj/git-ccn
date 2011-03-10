@@ -12,11 +12,15 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <arpa/inet.h>
 
 #define IS_BLANK(c) ((c) == ' ' || (c) == '\t')
 
 #define OPT_CMD "option"
 #define OPT_CMD_LEN (sizeof(OPT_CMD) - 1)
+
+#define LIST_CMD "list"
+#define LIST_CMD_LEN (sizeof(LIST_CMD) - 1)
 
 /* CCNx library handle */
 static struct ccn *ccnx;
@@ -37,6 +41,15 @@ static struct options {
         dry_run : 1,
         thin : 1;
 } options;
+
+/* Make sure this is aligned with the ref_entry structure in ccnx.c. */
+struct ref_entry {
+    unsigned int flags;
+    unsigned int ref_len;
+    unsigned int symref_len;
+    unsigned char sha1[20];
+    char ref[0];
+};
 
 
 static int
@@ -155,6 +168,84 @@ errval:
 }
 
 
+static int
+list(struct strbuf *cmd)
+{
+    int rv = 0, i;
+    size_t len;
+    struct ccn_charbuf *res = NULL, *name = NULL;
+    const unsigned char *ptr, *orig;
+    struct ccn_parsed_ContentObject content = {0};
+    struct ccn_indexbuf *refs = NULL;
+    struct ref_entry *e;
+
+    /* Create the Interest prefix for the list of refs */
+    if (!(name = ccn_charbuf_create()))
+        goto error;
+    if (ccn_charbuf_append_charbuf(name, prefix) < 0)
+        goto error;
+    if (ccn_name_append_str(name, "refs") < 0)
+        goto error;
+
+    if (!(res = ccn_charbuf_create()))
+        goto error;
+
+    len = 0;
+    if (ccn_get(ccnx, name, NULL, 3000, res,
+                &content, NULL, CCN_GET_NOKEYWAIT) >= 0)
+        ccn_content_get_value(res->buf, res->length, &content, &ptr, &len);
+    if (len == 0)
+        goto out;
+
+    if (!(refs = ccn_indexbuf_create()))
+        goto error;
+    orig = ptr;
+
+    while(len) {
+        if (len < sizeof(struct ref_entry))
+            goto error;
+
+        e = (struct ref_entry *)ptr;
+        e->flags = ntohl(e->flags);
+        e->ref_len = ntohl(e->ref_len);
+        e->symref_len = ntohl(e->symref_len);
+
+        if (len < (e->ref_len + e->symref_len + 2))
+            goto error;
+
+        if (ccn_indexbuf_append_element(refs, ptr - orig) < 0)
+            goto error;
+
+        ptr += sizeof(struct ref_entry) + e->ref_len + e->symref_len + 2;
+        len -= sizeof(struct ref_entry) + e->ref_len + e->symref_len + 2;
+    }
+
+    /* FIXME: We should make sure here that all symrefs can be resolved before
+     * printing everything */
+
+    for(i = 0; i < refs->n; i++) {
+        e = (struct ref_entry*)(orig + refs->buf[i]);
+        if (e->symref_len)
+            printf("@%s %s\n", e->ref + e->ref_len + 1, e->ref);
+        else
+            printf("%s %s\n", sha1_to_hex(e->sha1), e->ref);
+    }
+
+    printf("\n");
+    fflush(stdout);
+
+    goto out;
+error:
+    fprintf(stderr, "Can't obtain refs list.\n");
+    rv = -1;
+out:
+    ccn_indexbuf_destroy(&refs);
+    ccn_charbuf_destroy(&res);
+    ccn_charbuf_destroy(&name);
+    return rv;
+}
+
+
 int
 main(int argc, const char **argv)
 {
@@ -218,6 +309,10 @@ main(int argc, const char **argv)
                    && (isspace(cmd.buf[OPT_CMD_LEN])
                        || !cmd.buf[OPT_CMD_LEN])) {
             option(&cmd);
+        } else if (!strncmp(cmd.buf, LIST_CMD, LIST_CMD_LEN)
+                   && (isspace(cmd.buf[LIST_CMD_LEN])
+                       || !cmd.buf[LIST_CMD_LEN])) {
+            list(&cmd);
         } else {
             printf("Unsupported command.\n");
             goto error;
