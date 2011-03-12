@@ -29,11 +29,14 @@
 #include <signal.h>
 #include <limits.h>
 #include <errno.h>
+#include <zlib.h>
 #include "strbuf.h"
 #include "cache.h"
 #include "refs.h"
 #include "object.h"
 #include "tag.h"
+#include "commit.h"
+#include "blob.h"
 
 
 #define STR_INIT(v) {(v), sizeof(v) - 1}
@@ -370,6 +373,73 @@ error:
 }
 
 
+/* FIXME: This whole function needs to remain in sync with git code, otherwise
+ * we'll end up generating corrupting objects. Unfortunately there appears to
+ * be on equivalent function in git itself, hence we need to build the
+ * compressed object here by ourselves. */
+struct ccn_charbuf *
+get_deflated_object(unsigned char *sha1)
+{
+    void *body;
+    enum object_type type;
+    size_t body_len, hdr_len;
+    const char* type_str = NULL;
+    struct ccn_charbuf *buf = NULL;
+    char hdr[64];
+    z_stream s;
+    memset(&s, '\0', sizeof(z_stream));
+
+    /* Fetch the object body from the local database and generate the
+     * header. */
+    if (!(body = read_sha1_file(sha1, &type, &body_len)))
+        goto out;
+    switch(type) {
+    case OBJ_COMMIT: type_str = commit_type; break;
+    case OBJ_TREE:   type_str = tree_type;   break;
+    case OBJ_BLOB:   type_str = blob_type;   break;
+    case OBJ_TAG:    type_str = tag_type;    break;
+    default: goto error;
+    }
+    hdr_len = snprintf(hdr, 64, "%s %lu", type_str, body_len) + 1;
+
+    if (!(buf = ccn_charbuf_create()))
+        goto error;
+
+    /* Deflate the header and the body of the object */
+    if (deflateInit(&s, zlib_compression_level) != Z_OK)
+        goto error;
+
+    /* Reserve the whole target buffer at the beginning */
+    if (!ccn_charbuf_reserve(buf, deflateBound(&s, hdr_len + body_len)))
+        goto error;
+    s.next_out = buf->buf;
+    s.avail_out = buf->limit;
+
+    /* Start with the header, we ensured that the output buffer is big enough
+     * with deflateBound, hence no need to check the return value of
+     * deflate.  */
+    s.next_in = (unsigned char*)hdr;
+    s.avail_in = hdr_len;
+    deflate(&s, Z_NO_FLUSH);
+
+    s.next_in = body;
+    s.avail_in = body_len;
+    if (deflate(&s, Z_FINISH) != Z_STREAM_END)
+        goto error;
+
+    buf->length = s.total_out;
+    goto out;
+error:
+    ERR("Can't generate object for %s", sha1_to_hex(sha1));
+    ccn_charbuf_destroy(&buf);
+out:
+    deflateEnd(&s);
+    if (body)
+        free(body);
+    return buf;
+}
+
+
 /* This function is CCN Interest handler. It is called whenever ccnd receives
  * a matching Interest packet. The function is supposed to handle the Interest
  * and produce corresponding Data. */
@@ -383,7 +453,6 @@ child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
     struct ccn_charbuf *body = NULL, *data = NULL, *dname = NULL;
     struct ccn_signing_params sp = CCN_SIGNING_PARAMS_INIT;
     unsigned int b, e, i, v, comps_left;
-    void *obj = NULL;
 
     sp.freshness = 10;
     switch(kind) {
@@ -431,7 +500,6 @@ child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
         /* Lookup the object with the given SHA1 and return it */
         unsigned char sha1[20];
         const unsigned char* hex;
-        enum object_type type;
         size_t len;
 
         /* FIXME: We should switch to binary representation of SHA1, once I
@@ -442,16 +510,8 @@ child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
             goto out;
         if (get_sha1_hex((const char*)hex, sha1) != 0)
             goto out;
-        if (!(obj = read_sha1_file_repl(sha1, &type, &len, NULL)))
+        if (!(body = get_deflated_object(sha1)))
             goto out;
-        if (!(body = ccn_charbuf_create())) {
-            ERR("Memory allocation failure");
-            goto error;
-        }
-        if (ccn_charbuf_append(body, obj, len) < 0) {
-            ERR("Can't copy object");
-            goto error;
-        }
     } else if (comps_left == 1){
         /* Serve special files from the git repository */
         for(i = 0; specials[i].name; i++) {
@@ -485,8 +545,6 @@ child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
 error:
     res = CCN_UPCALL_RESULT_ERR;
 out:
-    if (obj)
-        free(obj);
     ccn_charbuf_destroy(&body);
     ccn_charbuf_destroy(&data);
     ccn_charbuf_destroy(&dname);
