@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
+
 
 #define IS_BLANK(c) ((c) == ' ' || (c) == '\t')
 
@@ -21,6 +23,9 @@
 
 #define LIST_CMD "list"
 #define LIST_CMD_LEN (sizeof(LIST_CMD) - 1)
+
+#define FETCH_CMD "fetch"
+#define FETCH_CMD_LEN (sizeof(FETCH_CMD) - 1)
 
 /* CCNx library handle */
 static struct ccn *ccnx;
@@ -49,6 +54,11 @@ struct ref_entry {
     unsigned int symref_len;
     unsigned char sha1[20];
     char ref[0];
+};
+
+struct walker_data {
+    struct ccn *ccnx;
+    struct ccn_charbuf *prefix;
 };
 
 
@@ -246,6 +256,235 @@ out:
 }
 
 
+/* FIXME:
+ * - Inflate the object, recompute the SHA1 and check it here
+ */
+static int
+save_deflated_object(const unsigned char *buf, size_t len,
+                     unsigned char *sha1)
+{
+    char *path, *sep, tmp[PATH_MAX];
+    int fd = -1, res = 0, n = 0;
+    ssize_t rv;
+
+    /* Check if, by any chance, the object appeared in the local database
+     * somehow. */
+    if (has_sha1_file(sha1))
+        goto out;
+
+    /* Fetch the object data here */
+
+    /* Open the local temporary file for loose object. */
+    path = sha1_file_name(sha1);
+    snprintf(tmp, sizeof(tmp), "%s.temp", path);
+    unlink_or_warn(tmp);
+
+    fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd < 0 && errno == ENOENT) {
+        /* The local cache directory may not exist yet, try to create it. */
+        if ((sep = strrchr(tmp, '/'))) {
+            *sep = '\0';
+            if (mkdir(tmp, 0777) < 0) {
+                fprintf(stderr, "fatal: Couldn't create directory %s: %s\n",
+                        tmp, strerror(errno));
+                goto error;
+            }
+            *sep = '/';
+            fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0666);
+        }
+    }
+    if (fd < 0) {
+        fprintf(stderr, "fatal: Couldn't create file '%s': %s\n",
+                tmp, strerror(errno));
+        goto error;
+    }
+
+    /* Write the compressed object into the temporary file. */
+    while (n < len) {
+        if ((rv = xwrite(fd, buf + n, len - n)) < 0) {
+            fprintf(stderr, "fatal: Can't write object: %s\n",
+                    strerror(errno));
+            goto error;
+        }
+        n += rv;
+    }
+
+    /* Move the temporary file to the correct place. */
+    if (move_temp_to_file(tmp, path) < 0)
+        goto error;
+
+    goto out;
+error:
+    res = -1;
+    unlink_or_warn(tmp);
+out:
+    close(fd);
+    return res;
+}
+
+
+static int
+fetch_object(struct walker *w, unsigned char *sha1)
+{
+    int res = 0;
+    size_t len = 0;
+    struct walker_data *d = w->data;
+    const unsigned char *ptr;
+    struct ccn_charbuf *buf = NULL;
+    struct ccn_parsed_ContentObject content = {0};
+
+    /* Replace the SHA1 placeholder in the prefix with actual SHA1 of the
+     * object we want to fetch. */
+    memcpy(d->prefix->buf + d->prefix->length - 40 - sizeof(CCN_CLOSE) * 2,
+           sha1_to_hex(sha1), 40);
+
+    if (!(buf = ccn_charbuf_create()))
+        goto error;
+    if (ccn_get(d->ccnx, d->prefix, NULL, 3000, buf, &content, NULL,
+                CCN_GET_NOKEYWAIT) >= 0)
+        ccn_content_get_value(buf->buf, buf->length, &content, &ptr, &len);
+    if (len == 0
+        || save_deflated_object(ptr, len, sha1) == 0)
+        goto out;
+
+error:
+    res = -1;
+out:
+    ccn_charbuf_destroy(&buf);
+    return res;
+}
+
+
+static void
+cleanup(struct walker *w)
+{
+    struct walker_data *data = w->data;
+
+    if (data) {
+        ccn_charbuf_destroy(&data->prefix);
+        free(data);
+    }
+}
+
+
+static void
+prefetch(struct walker *w, unsigned char *sha1)
+{
+    /* Here we need to implement a queue of fetch requests and start fetching
+     * them in a stream-lined manner as soon as requests are added to the
+     * queue to speed things up. At any given time the tree walker can yield a
+     * number of objects that are missing in the repository and will be needed
+     * while traversing the DAG. */
+}
+
+
+/* Create a new walker data structure. This function exists on failure and
+ * never returns NULL */
+static struct walker *
+get_ccnx_walker(const struct ccn_charbuf *prefix)
+{
+    char closer[] = {CCN_CLOSE, CCN_CLOSE};
+    struct walker_data *d = xmalloc(sizeof(struct walker_data));
+    struct walker *w = xmalloc(sizeof(struct walker));
+    memset(w, '\0', sizeof(struct walker));
+
+    /* Create the Interest prefix for fetching individual git objects. The
+     * rest of the prefix is appended to the variable in fetch_object. Here we
+     * reserve all the memory that will be needed in fetch_object so that it
+     * doesn't have to deal with memory checking at runtime. */
+    if (!(d->prefix = ccn_charbuf_create())
+        || (ccn_charbuf_append(d->prefix, prefix->buf, prefix->length - 1) < 0)
+        || (ccn_charbuf_append_tt(d->prefix, CCN_DTAG_Component, CCN_DTAG) < 0)
+        || (ccn_charbuf_append_tt(d->prefix, 7, CCN_BLOB) < 0)
+        || (ccn_charbuf_append(d->prefix, "objects", 7) < 0)
+        || (ccn_charbuf_append_value(d->prefix,
+                                     CCN_CLOSE, sizeof(CCN_CLOSE)) < 0)
+        || (ccn_charbuf_append_tt(d->prefix, CCN_DTAG_Component, CCN_DTAG) < 0)
+        || (ccn_charbuf_append_tt(d->prefix, 40, CCN_BLOB) < 0)
+        || (ccn_charbuf_append(d->prefix, EMPTY_TREE_SHA1_HEX, 40) < 0)
+        || (ccn_charbuf_append(d->prefix, closer, sizeof(closer)) < 0))
+        die("fatal: Out of memory\n");
+    d->ccnx = ccnx;
+
+    w->corrupt_object_found = 0;
+    w->prefetch = prefetch;
+    w->fetch = fetch_object;
+    w->cleanup = cleanup;
+    w->data = d;
+
+    return w;
+}
+
+
+static void
+fetch(struct strbuf *cmd)
+{
+    const char *ptr;
+    char **heads;
+    size_t left;
+    int res = 0, heads_n = 0;
+    struct walker *w = NULL;
+
+    do {
+        /* Parse the command line */
+        ptr = cmd->buf + FETCH_CMD_LEN + 1;
+        left = cmd->len - FETCH_CMD_LEN - 1;
+        while(left && isspace(*ptr)) {
+            ptr++; left--;
+        }
+        if (left < 41 || !isspace(ptr[40]))
+            goto error;
+
+        /* Add it to the array of all refs */
+        heads = xrealloc(heads, sizeof(char *) * ++heads_n);
+        heads[heads_n - 1] = xstrndup(ptr, 40);
+
+        /* Parse another line and repeat until empty line */
+        strbuf_reset(cmd);
+        if (strbuf_getline(cmd, stdin, '\n') == EOF)
+            goto error;
+        strbuf_trim(cmd);
+        if (!cmd->len)
+            break;
+        if (strncmp(cmd->buf, FETCH_CMD, FETCH_CMD_LEN)
+            || !isspace(cmd->buf[FETCH_CMD_LEN]))
+            goto error;
+    } while(1);
+
+    if (options.depth)
+        die("dumb ccnx transport does not support --depth");
+
+    w = get_ccnx_walker(prefix);
+    w->get_all = 1;
+    w->get_tree = 1;
+    w->get_history = 1;
+    w->get_verbosely = options.verbosity >= 3;
+    w->get_recover = 0;
+
+    if (walker_fetch(w, heads_n, heads, NULL, NULL) < 0)
+        goto error;
+
+    printf("\n");
+    fflush(stdout);
+
+    goto out;
+error:
+    res = -1;
+out:
+    if (w)
+        walker_free(w);
+
+    while(heads_n)
+        free(heads[--heads_n]);
+    free(heads);
+
+    if (res == -1) {
+        fprintf(stderr, "fatal: Can't fetch refs.\n");
+        exit(128);
+    }
+}
+
+
 int
 main(int argc, const char **argv)
 {
@@ -304,7 +543,10 @@ main(int argc, const char **argv)
             goto skip;
 
         if (!strcmp(cmd.buf, "capabilities")) {
-            printf("option\n\n");
+            printf("fetch\noption\n\n");
+        } else if (!strncmp(cmd.buf, FETCH_CMD, FETCH_CMD_LEN)
+                   && isspace(cmd.buf[FETCH_CMD_LEN])) {
+            fetch(&cmd);
         } else if (!strncmp(cmd.buf, OPT_CMD, OPT_CMD_LEN)
                    && (isspace(cmd.buf[OPT_CMD_LEN])
                        || !cmd.buf[OPT_CMD_LEN])) {
