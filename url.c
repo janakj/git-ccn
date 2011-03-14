@@ -29,7 +29,7 @@ int is_url(const char *url)
 	if (!first_slash || first_slash == url)
 		return 0;
 	/* Character before must be : and next must be /. */
-	if (first_slash[-1] != ':' || first_slash[1] != '/')
+	if (first_slash[-1] != ':')
 		return 0;
 	/* There must be something before the :// */
 	if (first_slash == url + 1)
