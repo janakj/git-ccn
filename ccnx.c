@@ -38,6 +38,7 @@
 #include "commit.h"
 #include "blob.h"
 
+#define FRAGMENT_SIZE 64000
 
 #define STR_INIT(v) {(v), sizeof(v) - 1}
 
@@ -114,6 +115,7 @@ Options:\n\
     -E       Write log messages to standard output instead of syslog.\n\
     -p name  CCNx name prefix to register with ccnd.\n\
     -r dir   Top-level directory with Git repositories.\n\
+    -s size  Maximum size of Data packet body (1 to 4294967296).\n\
 ";
 
 /* If set to 1 write messages to syslog. If 0 write them to standard and error
@@ -140,6 +142,10 @@ static struct {
     STR_INIT("info/refs"),
     STR_INIT("objects/info/packs"),
     {NULL, 0}};
+
+
+/* The maximum size of Data packet content. */
+static unsigned int fragment_size = FRAGMENT_SIZE;
 
 
 /* Returns text representation of current date and time. Only current month,
@@ -487,16 +493,14 @@ child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
 
     b = info->pi->offset[CCN_PI_B_Name];
     e = info->pi->offset[CCN_PI_E_ComponentLast];
-    ccn_charbuf_append(dname, info->interest_ccnb + b, e - b);
-    ccn_charbuf_append_closer(dname);
 
-    if (comps_left == 1 && op_len == 4
+    if (comps_left <= 2 && op_len == 4
         && !strncmp((char*)op, "refs", op_len)) {
         /* Return the list of all refs from the repository */
         if (!(body = get_reflist()))
             goto error;
-    } else if (comps_left == 2 && op_len == 7
-               && !strncmp((char*)op, "objects", op_len)) {
+    } else if ((comps_left == 2 || comps_left == 3)
+               && op_len == 7 && !strncmp((char*)op, "objects", op_len)) {
         /* Lookup the object with the given SHA1 and return it */
         unsigned char sha1[20];
         const unsigned char* hex;
@@ -512,7 +516,7 @@ child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
             goto out;
         if (!(body = get_deflated_object(sha1)))
             goto out;
-    } else if (comps_left == 1){
+    } else if (comps_left <= 2) {
         /* Serve special files from the git repository */
         for(i = 0; specials[i].name; i++) {
             if (op_len == specials[i].len
@@ -527,22 +531,57 @@ child_handler(struct ccn_closure *selfp, enum ccn_upcall_kind kind,
         }
     }
 
-    /* If the functions above produced content, even empty, sign it */
+    /* Generate Data packets only if one of the functions above actually
+     * produced some content. */
     if (!body) goto out;
-    if (ccn_sign_content(info->h, data, dname, &sp,
-                         body->buf, body->length) < 0)
-        goto error;
 
-    if (data->length > 65535) {
-        INF("Object may be too big to send in one piece: %lu", data->length);
+    /* Number of fragments */
+    unsigned int n = body->length / fragment_size
+        + !!(body->length % fragment_size);
+    if (n > 1) {
+        sp.template_ccnb = ccn_charbuf_create();
+        ccn_charbuf_append_tt(sp.template_ccnb, CCN_DTAG_SignedInfo, CCN_DTAG);
+        ccn_charbuf_append_tt(sp.template_ccnb, CCN_DTAG_FinalBlockID,
+                              CCN_DTAG);
+        char s[32];
+        uintmax_t j;
+        for (j = n - 1, i = sizeof(s); j != 0 && i > 0; i--, j >>= 8)
+            s[i-1] = j & 0xff;
+        s[--i] = CCN_MARKER_SEQNUM;
+        ccn_charbuf_append_tt(sp.template_ccnb, sizeof(s) - i, CCN_BLOB);
+        ccn_charbuf_append(sp.template_ccnb, s + i, sizeof(s) - i);
+        ccn_charbuf_append_closer(sp.template_ccnb); /* blob */
+        ccn_charbuf_append_closer(sp.template_ccnb); /* SignedInfo */
     }
+    for(i = 0; i < n; i++) {
+        /* Build the Data packet's name. */
+        ccn_charbuf_reset(dname);
+        ccn_charbuf_append(dname, info->interest_ccnb + b, e - b);
+        ccn_charbuf_append_closer(dname);
+        if (n > 1) {
+            /* Include sequence number and FinalBlockID if we have more than
+             * one fragment. */
+            ccn_name_append_numeric(dname, CCN_MARKER_SEQNUM, i);
+            sp.sp_flags |= CCN_SP_TEMPL_FINAL_BLOCK_ID;
+        }
 
-    if (ccn_put(info->h, data->buf, data->length) < 0)
-        goto error;
+        /* Sign the Data packet's content. */
+        ccn_charbuf_reset(data);
+        if (ccn_sign_content(info->h, data, dname, &sp,
+                             body->buf + i * fragment_size,
+                             (i == n - 1) ? body->length - fragment_size * i :
+                             fragment_size) < 0)
+            goto error;
+
+        /* Send the Data packet to the content store */
+        if (ccn_put(info->h, data->buf, data->length) < 0)
+            goto error;
+    }
     res = CCN_UPCALL_RESULT_INTEREST_CONSUMED;
 
     goto out;
 error:
+    ERR("Error occurred in child_handler");
     res = CCN_UPCALL_RESULT_ERR;
 out:
     ccn_charbuf_destroy(&body);
@@ -680,9 +719,10 @@ int
 main(int argc, char *argv[])
 {
     int res = EXIT_SUCCESS, opt;
+    long val;
 
     start_logger();
-    while((opt = getopt(argc, argv, "hp:r:vE")) != -1) {
+    while((opt = getopt(argc, argv, "hp:r:vEs:")) != -1) {
         switch(opt) {
         case 'h':
             fprintf(stdout, "%s", help_msg);
@@ -702,6 +742,15 @@ main(int argc, char *argv[])
         case 'E':
             log_syslog = 0;
             break;
+        case 's':
+            val = atol(optarg);
+            if (val <= 0 || val > UINT_MAX) {
+                fprintf(stderr, "Maximum fragment size must be in the range "
+                        "of 1 to %u.\n", UINT_MAX);
+                exit(EXIT_FAILURE);
+            }
+            fragment_size = (unsigned int)val;
+            break;
         default:
             fprintf(stderr, "Use the -h option for list of supported "
                     "program arguments\n");
@@ -712,6 +761,10 @@ main(int argc, char *argv[])
     printf("CCNx Git Server for CCNx API v%d, built on "
            __DATE__ " " __TIME__ "\n",
            CCN_API_VERSION);
+
+    if (fragment_size > FRAGMENT_SIZE)
+        WARN("Using fragment size greater than %u bytes "
+             "may cause problems.\n", FRAGMENT_SIZE);
 
     if (!(prefix = ccn_charbuf_create()))
         goto error;
