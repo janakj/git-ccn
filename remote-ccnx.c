@@ -323,6 +323,177 @@ out:
 }
 
 
+/* If the decoded d points to a blob with CCN_MARKER_SEQNUM marker, the
+ * function converts the sequence number into unsigned integer and stores the
+ * value in v. If it is not a blob starting with CCN_MARKER_SEQNUM the
+ * function returns 0. */
+static int
+seqnum_to_uint(unsigned int *v, struct ccn_buf_decoder *d)
+{
+    const unsigned char *buf;
+    size_t len;
+    unsigned int i;
+
+    /* In CCN sequence number representation, 0 is expressed is empty string
+     * and the string will contain CCN_MARKER_SEQNUM as the only character.
+     * Also, if the blob appears to be too long, it's probably not an
+     * number. */
+    if (!ccn_buf_match_blob(d, &buf, &len)
+        || len < 1 || len > 6
+        || buf[0] != CCN_MARKER_SEQNUM)
+        return 0;
+
+    buf++; len--;
+    for(i = 0, *v = 0; i < len; i++) {
+        *v <<= 8;
+        *v += buf[i];
+    }
+    return 1;
+}
+
+
+/* Given a Data packet, the function determines if the packet is part of a
+ * fragmented object by inspecting the last components of its Name and the
+ * value of FindBlockID header. Argument frag is set to the fragment number of
+ * the current packet (counting from 0). Argument last_frag it set to the
+ * number of the last fragment for the object. If both arguments are 0 then
+ * the packet contains the whole object, i.e., is not a fragment.
+ *
+ * The return value of 0 indicates that the fragment data in the packet is
+ * incorrect and the packet should be discarded. On success the function
+ * returns 1. */
+static int
+get_frag_info(unsigned int *frag, unsigned int *last_frag,
+              const unsigned char *buf, struct ccn_indexbuf *comps,
+              struct ccn_parsed_ContentObject *c)
+{
+    size_t len;
+    int have_frag = 0, have_last_frag = 0;
+    struct ccn_buf_decoder decoder, *d;
+
+    *frag = 0;
+    *last_frag = 0;
+
+    /* First of all see if we have FinalBlockID */
+    len = c->offset[CCN_PCO_E_FinalBlockID]
+        - c->offset[CCN_PCO_B_FinalBlockID];
+    if (len <= 0)
+        goto no_last_frag;
+    d = ccn_buf_decoder_start(&decoder,
+                              buf + c->offset[CCN_PCO_B_FinalBlockID],
+                              len);
+    if (!ccn_buf_match_dtag(d, CCN_DTAG_FinalBlockID))
+        return 0; /* Error in ccnx */
+    ccn_buf_advance(d);
+    if (!seqnum_to_uint(last_frag, d))
+        return 0; /* Wrong format of FinalBlockID */
+    if (*last_frag < 1)
+        return 0; /* FinalBlockID is set to 0, that's an error. */
+    have_last_frag = 1;
+no_last_frag:
+
+    if (comps->n < 2)
+        goto no_frag; /* Name to short to contain fragment number. */
+
+    d = ccn_buf_decoder_start(&decoder, buf + comps->buf[comps->n - 2],
+                              comps->buf[comps->n - 1]
+                              - comps->buf[comps->n - 2]);
+    if (!ccn_buf_match_dtag(d, CCN_DTAG_Component))
+        return 0; /* Error in ccnx */
+    ccn_buf_advance(d);
+    if (!seqnum_to_uint(frag, d))
+        goto no_frag; /* Component is not a fragment number. */
+    have_frag = 1;
+no_frag:
+
+    /* Both the fragment number and last fragment number must be either
+     * present or absent to indicate success. */
+    return !(have_frag ^ have_last_frag);
+}
+
+
+static int
+fetch_fragments(struct ccn_charbuf *buf, struct ccn_parsed_ContentObject *o,
+                struct walker_data *d,
+                unsigned char *sha1, unsigned int have, unsigned int last)
+{
+    struct ccn_charbuf **frags = NULL, *name = NULL, *tmp = NULL;
+    struct ccn_parsed_ContentObject content = {0};
+    struct ccn_indexbuf *comps = NULL;
+    const unsigned char *ptr;
+    size_t len;
+    int i, res = 0;
+
+    frags = xmalloc(sizeof(struct ccn_charbuf*) * (last + 1));
+    memset(frags, '\0', sizeof(struct ccn_charbuf*) * (last + 1));
+
+    /* Copy the fragment we already received into the array */
+    frags[have] = ccn_charbuf_create();
+    if (ccn_content_get_value(buf->buf, buf->length, o, &ptr, &len) < 0)
+        goto error;
+    if (len == 0)
+        goto error;
+    ccn_charbuf_append(frags[have], ptr, len);
+
+    tmp = ccn_charbuf_create();
+    name = ccn_charbuf_create();
+
+    for(i = 0; i <= last; i++) {
+        if (frags[i]) continue;
+
+        /* Reset variables */
+        ccn_charbuf_reset(tmp);
+        frags[i] = ccn_charbuf_create();
+        ccn_indexbuf_destroy(&comps);
+        comps = ccn_indexbuf_create();
+        memset(&content, '\0', sizeof(struct ccn_parsed_ContentObject));
+
+        /* Replace the SHA1 placeholder in the prefix with actual SHA1 of the
+         * object we want to fetch. */
+        memcpy(d->prefix->buf + d->prefix->length - 40 - sizeof(CCN_CLOSE) * 2,
+               sha1_to_hex(sha1), 40);
+        ccn_charbuf_reset(name);
+        ccn_charbuf_append_charbuf(name, d->prefix);
+        ccn_name_append_numeric(name, CCN_MARKER_SEQNUM, i);
+
+        if (ccn_get(d->ccnx, name, NULL, 3000, tmp,
+                    &content, comps, CCN_GET_NOKEYWAIT) < 0)
+            goto error;
+
+        /* Fragment sanity checking */
+        unsigned int frag, l;
+        if (!get_frag_info(&frag, &l, tmp->buf, comps, &content))
+            goto error;
+        if (frag != i || l != last)
+            goto error;
+
+        /* Store data in the array */
+        ccn_content_get_value(tmp->buf, tmp->length, &content, &ptr, &len);
+        if (len == 0)
+            goto error;
+
+        ccn_charbuf_append(frags[i], ptr, len);
+    }
+
+    ccn_charbuf_reset(buf);
+    for(i = 0; i <= last; i++) {
+        ccn_charbuf_append_charbuf(buf, frags[i]);
+    }
+
+    goto out;
+error:
+    res = -1;
+out:
+    ccn_charbuf_destroy(&name);
+    ccn_charbuf_destroy(&tmp);
+    ccn_indexbuf_destroy(&comps);
+    for(i = 0; i < last; i++)
+        ccn_charbuf_destroy(frags + i);
+    free(frags);
+    return res;
+}
+
+
 static int
 fetch_object(struct walker *w, unsigned char *sha1)
 {
@@ -332,19 +503,35 @@ fetch_object(struct walker *w, unsigned char *sha1)
     const unsigned char *ptr;
     struct ccn_charbuf *buf = NULL;
     struct ccn_parsed_ContentObject content = {0};
+    struct ccn_indexbuf *comps;
+    unsigned int have_frag, last_frag;
 
     /* Replace the SHA1 placeholder in the prefix with actual SHA1 of the
      * object we want to fetch. */
     memcpy(d->prefix->buf + d->prefix->length - 40 - sizeof(CCN_CLOSE) * 2,
            sha1_to_hex(sha1), 40);
 
-    if (!(buf = ccn_charbuf_create()))
+    if (!(buf = ccn_charbuf_create())
+        || !(comps = ccn_indexbuf_create()))
         goto error;
-    if (ccn_get(d->ccnx, d->prefix, NULL, 3000, buf, &content, NULL,
-                CCN_GET_NOKEYWAIT) >= 0)
-        ccn_content_get_value(buf->buf, buf->length, &content, &ptr, &len);
-    if (len == 0
-        || save_deflated_object(ptr, len, sha1) == 0)
+    if (ccn_get(d->ccnx, d->prefix, NULL, 3000, buf, &content, comps,
+                CCN_GET_NOKEYWAIT) < 0)
+        goto error;
+    if (!get_frag_info(&have_frag, &last_frag, buf->buf, comps, &content))
+        goto error;
+
+    if (last_frag) {
+        /* We have more than one fragment, fetch them all */
+        if (fetch_fragments(buf, &content, d, sha1, have_frag, last_frag) < 0)
+            goto error;
+        ptr = buf->buf; len = buf->length;
+    } else
+        /* Not fragmented, we have the whole object. */
+        if (ccn_content_get_value(buf->buf, buf->length,
+                                  &content, &ptr, &len) < 0)
+            goto error;
+
+    if (len && (save_deflated_object(ptr, len, sha1) == 0))
         goto out;
 
 error:
